@@ -59,7 +59,7 @@ from .lsnn import (
     LSNNState,
     LSNNLayer,
 )
-from .regularization import RegularizationCell
+from .regularization import RegularizationCell, RegularizationWrapper
 from .sequential import SequentialState
 
 __all__ = [
@@ -122,5 +122,6 @@ __all__ = [
     "LSNNLayer",
     "LSNNState",
     "RegularizationCell",
+    "RegularizationWrapper",
     "SequentialState",
 ]
