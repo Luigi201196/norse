@@ -23,54 +23,75 @@ from norse.torch import Lift, SequentialState, RegularizationWrapper
 
 
 class LIFConvNet(pl.LightningModule):
-    def __init__(self, num_channels, lr, optimizer, p):
+    def __init__(self, seq_length, num_channels, lr, optimizer, p, lr_step=True):
         super(LIFConvNet, self).__init__()
         self.lr = lr
         self.optimizer = optimizer
         self.rsnn = SequentialState(
-            torch.nn.Conv2d(num_channels, 128, 3),  # 0
-            RegularizationWrapper(LIFFeedForwardCell(p)),
-            torch.nn.Conv2d(128, 256, 3),
-            torch.nn.AvgPool2d(2, 2),
-            torch.nn.BatchNorm2d(256),
-            RegularizationWrapper(LIFFeedForwardCell(p)),  # 5
-            torch.nn.Conv2d(256, 512, 3),
-            torch.nn.AvgPool2d(2, 2),
-            torch.nn.BatchNorm2d(512),
-            torch.nn.Conv2d(512, 1024, 3),
-            torch.nn.Conv2d(1024, 512, 3),  # 10
+            torch.nn.Conv2d(num_channels, 64, 3),
+            RegularizationWrapper(LIFFeedForwardCell(p)),  # 3
+            torch.nn.MaxPool2d(2, 2, ceil_mode=True),
+            torch.nn.BatchNorm2d(64),
+            torch.nn.Conv2d(64, 128, 3),
+            RegularizationWrapper(LIFFeedForwardCell(p)),  # 7
+            torch.nn.MaxPool2d(3, 3, ceil_mode=True),
+            torch.nn.BatchNorm2d(128),
+            # torch.nn.Conv2d(128, 512, 2),
+            # RegularizationWrapper(LIFFeedForwardCell(p)),  # 1
+            # torch.nn.MaxPool2d(2, 2, ceil_mode=True),
             torch.nn.Flatten(1),
-            torch.nn.Linear(2048, 1024),
-            RegularizationWrapper(LIFFeedForwardCell(p)),
+            torch.nn.Linear(3200, 1024),
             torch.nn.Linear(1024, 512),
-            RegularizationWrapper(LIFFeedForwardCell(p)),  # 15
+            RegularizationWrapper(LIFFeedForwardCell(p)),
+            torch.nn.Dropout(0.2),
             torch.nn.Linear(512, 10),
             LIFeedForwardCell(),
         )
 
     def forward(self, x):
+        # X was shape (batch, time, ...)
+        # And will be (time, batch, ...)
+        x = x.permute(1, 0, 2, 3, 4)
         voltages = torch.zeros(*x.shape[:2], 10, device=x.device, dtype=x.dtype)
         s = None
-        for ts in range(x.shape[0]):
-            out, s = self.rsnn(x[ts], s)  # .permute(1, 0, 2)
-            # m, _ = torch.max(voltages, 0)
+        for ts in range(3, x.shape[0]):
+            timestep = x[ts]
+            out, s = self.rsnn(timestep, s)
             voltages[ts, :, :] = out
+            
+        m = voltages[-5:].sum(0)
+        regularization = torch.as_tensor(0)
+        for spikes in s[1].count, s[5].count, s[11].count:
+            regularization = regularization + max(0, 1000 - spikes) * 1e-5
+            regularization = regularization + max(0, spikes - 1000) * 1e-5
 
-        m, _ = voltages.max(1)
-        regularization = (s[1].count + s[5].count + s[13].count + s[15].count) * 1e-6
+        self.log("Reg.", regularization.item(), prog_bar=True)
+        self.log("Spike1", s[1].count.item())
+        self.log("Spike5", s[5].count.item())
+        self.log("Spike11", s[11].count.item())
         return torch.nn.functional.log_softmax(m, dim=1), regularization
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        out, regularization = self(x)
-        loss = torch.nn.functional.nll_loss(out, y) + regularization
+        out, reg = self(x)
+        loss = torch.nn.functional.nll_loss(out, y) + reg
         return loss
+
+    def training_epoch_end(self, outputs):
+        if self.lr_step:
+            self.scheduler.step()
 
     def configure_optimizers(self):
         if self.optimizer == "adam":
-            return torch.optim.Adam(self.parameters(), lr=self.lr)
+            optimizer = torch.optim.Adam(
+                self.parameters(), lr=self.lr, weight_decay=1e-5
+            )
         else:
-            return torch.optim.SGD(self.parameters(), lr=self.lr)
+            optimizer = torch.optim.SGD(self.parameters(), lr=self.lr)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=10, gamma=0.1
+        )
+        return optimizer
 
 
 def main(args):
@@ -147,7 +168,11 @@ def main(args):
 
     # Define and train the model
     model = LIFConvNet(
-        num_channels=num_channels, lr=args.lr, optimizer=args.optimizer, p=p
+        seq_length=args.seq_length,
+        num_channels=num_channels,
+        lr=args.lr,
+        optimizer=args.optimizer,
+        p=p,
     )
     trainer = pl.Trainer.from_argparse_args(args)
     trainer.fit(model, train_loader)
@@ -163,11 +188,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size", default=32, type=int, help="Number of examples in one minibatch"
     )
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate to use.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate to use.")
+    parser.add_argument(
+        "--lr_step",
+        type=bool,
+        default=True,
+        help="Use a stepper to reduce learning weight.",
+    )
     parser.add_argument(
         "--current_encoder_v_th",
         type=float,
-        default=0.7,
+        default=0.8,
         help="Voltage threshold for the LIF dynamics",
     )
     parser.add_argument(
@@ -192,7 +223,7 @@ if __name__ == "__main__":
         help="Optimizer to use for training.",
     )
     parser.add_argument(
-        "--seq_length", default=100, type=int, help="Number of timesteps to do."
+        "--seq_length", default=64, type=int, help="Number of timesteps to do."
     )
     parser.add_argument(
         "--manual_seed", default=0, type=int, help="Random seed for torch"
